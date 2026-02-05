@@ -1,0 +1,18 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+/tmp/flask_server.log
+
+# ESP-IDF
+build/
+hello_world/build/
+hello_world/sdkconfig
+hello_world/sdkconfig.old
+hello_world/dependencies.lock
+
+# OS
+.DS_Store
+.vscode/
+.idea/
