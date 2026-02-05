@@ -12,11 +12,16 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# 설정
-PROJECT_DIR="/Users/jinhojung/Desktop/ESP-IDF/hello_world"
+# 현재 스크립트 위치 기준 설정
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+PROJECT_DIR="$SCRIPT_DIR/hello_world"
 SERIAL_PORT="/dev/cu.usbmodem1101"
-FLASK_SERVER_SCRIPT="/Users/jinhojung/Desktop/ESP-IDF/serial_web_server.py"
-VENV_PATH="/Users/jinhojung/Desktop/ESP-IDF/.venv"
+FLASK_SERVER_SCRIPT="$SCRIPT_DIR/serial_web_server.py"
+VENV_PATH="$SCRIPT_DIR/.venv"
+
+# ESP-IDF 설정 (settings.json 기반)
+IDF_PATH="/Users/jinhojung/.espressif/v5.5.2/esp-idf"
+PYTHON_BIN="/Users/jinhojung/.espressif/python_env/idf5.5_py3.14_env/bin/python"
 
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}  ESP-Web-Monitor 빌드 및 업로드${NC}"
@@ -36,8 +41,6 @@ fi
 
 # 2. ESP-IDF 환경 설정
 echo -e "${YELLOW}[2/4] ESP-IDF 환경 설정 중...${NC}"
-export PATH="/Users/jinhojung/.espressif/python_env/idf5.5_py3.14_env/bin:$PATH"
-export IDF_PATH="$HOME/esp/esp-idf"
 source "$IDF_PATH/export.sh" > /dev/null 2>&1
 echo -e "${GREEN}✓ ESP-IDF 환경 설정 완료${NC}"
 
@@ -60,11 +63,15 @@ sleep 2
 
 # 4. Flask 서버 재시작
 echo -e "${YELLOW}[4/4] Flask 서버 재시작 중...${NC}"
-cd /Users/jinhojung/Desktop/ESP-IDF
-source "$VENV_PATH/bin/activate"
-nohup python "$FLASK_SERVER_SCRIPT" > /tmp/flask_server.log 2>&1 &
-FLASK_NEW_PID=$!
-echo -e "${GREEN}✓ Flask 서버 재시작됨 (PID: $FLASK_NEW_PID)${NC}"
+cd "$SCRIPT_DIR"
+if [ -d "$VENV_PATH" ]; then
+    source "$VENV_PATH/bin/activate"
+    nohup python "$FLASK_SERVER_SCRIPT" > /tmp/flask_server.log 2>&1 &
+    FLASK_NEW_PID=$!
+    echo -e "${GREEN}✓ Flask 서버 재시작됨 (PID: $FLASK_NEW_PID)${NC}"
+else
+    echo -e "${RED}✗ 가상환경(.venv)을 찾을 수 없습니다. Flask 서버를 시작할 수 없습니다.${NC}"
+fi
 
 echo ""
 echo -e "${GREEN}========================================${NC}"
@@ -73,3 +80,4 @@ echo -e "${GREEN}========================================${NC}"
 echo -e "${BLUE}웹 대시보드: http://localhost:8080${NC}"
 echo -e "${BLUE}Flask 로그: tail -f /tmp/flask_server.log${NC}"
 echo ""
+
