@@ -12,6 +12,9 @@ hello_world/sdkconfig
 hello_world/sdkconfig.old
 hello_world/dependencies.lock
 
+# Secrets
+hello_world/main/wifi_secrets.h
+
 # OS
 .DS_Store
 .vscode/
