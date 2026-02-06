@@ -2,273 +2,289 @@ import threading
 import time
 import serial
 import subprocess
-from flask import Flask, render_template_string, jsonify
+import sys
+from flask import Flask, render_template_string, jsonify, request
 from collections import deque
 
 # --- 설정 ---
-SERIAL_PORT = '/dev/cu.usbmodem1101'
+SERIAL_PORT = '/dev/cu.usbmodem2101'
 BAUD_RATE = 115200
-MAX_LINES = 500  
+MAX_BUFFER_LINES = 1000  
 
-# --- 데이터 저장소 ---
-log_buffer = deque(maxlen=MAX_LINES)
+# --- 글로벌 상태 관리 ---
 app = Flask(__name__)
+log_queue = deque(maxlen=MAX_BUFFER_LINES)
+log_sequence = 0
+serial_inst = None
+serial_lock = threading.Lock()
+is_connected = False
 
-# --- 시리얼 읽기 쓰레드 ---
-def read_serial():
-    try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-        # 중요: 연결 시 DTR/RTS를 꺼서 ESP32가 리셋되거나 부트로더 모드로 빠지는 것을 방지
-        ser.dtr = False
-        ser.rts = False
-        
-        print(f"✅ Connected to {SERIAL_PORT}")
-        while True:
-            if ser.in_waiting:
+# --- 시리얼 리스너 쓰레드 ---
+def serial_listener():
+    global serial_inst, log_sequence, is_connected
+    buffer = b""
+    
+    while True:
+        with serial_lock:
+            if serial_inst is None:
                 try:
-                    line = ser.readline().decode('utf-8', errors='replace').rstrip()
-                    if line:
-                        print(f"[Serial] {line}")
-                        log_buffer.append(line)
-                except Exception:
-                    pass
-            time.sleep(0.005) 
-    except Exception as e:
-        print(f"❌ Serial Error: {e}")
+                    serial_inst = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+                    serial_inst.dtr = False
+                    serial_inst.rts = False
+                    is_connected = True
+                    print(f"📡 Serial Connected: {SERIAL_PORT}")
+                except Exception as e:
+                    if time.time() % 5 < 0.1: # 5초마다 한 번만 출력
+                        print(f"⌛ Serial port {SERIAL_PORT} busy or not found: {e}")
+                    is_connected = False
+                    serial_inst = None
+                    time.sleep(1)
+                    continue
+            
+            try:
+                if serial_inst.in_waiting:
+                    # 바이너리로 읽어서 줄바꿈 단위로 정확히 파싱
+                    chunk = serial_inst.read(serial_inst.in_waiting)
+                    buffer += chunk
+                    if b"\n" in buffer:
+                        lines = buffer.split(b"\n")
+                        # 마지막 미완성 줄은 다시 버퍼에 저장
+                        buffer = lines.pop()
+                        for l in lines:
+                            text = l.decode('utf-8', errors='replace').rstrip()
+                            if text:
+                                log_sequence += 1
+                                log_queue.append({"id": log_sequence, "text": text, "time": time.strftime("%H:%M:%S")})
+            except Exception as e:
+                print(f"❌ Serial Error: {e}")
+                is_connected = False
+                if serial_inst:
+                    try: serial_inst.close()
+                    except: pass
+                serial_inst = None
+        
+        time.sleep(0.01)
 
-# --- 웹 서버 라우트 ---
+# --- 웹 대시보드 템플릿 (Premium UI) ---
+INDEX_HTML = '''
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>ESP32 Web Console</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0d1117;
+            --card-bg: #161b22;
+            --accent-color: #58a6ff;
+            --text-color: #c9d1d9;
+            --terminal-green: #3fb950;
+            --error-red: #f85149;
+        }
+        
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: 'JetBrains Mono', monospace;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+            line-height: 1.1; /* 행간 축소 */
+        }
+
+        #navbar {
+            padding: 10px 25px; /* 헤더 높이도 살짝 축소 */
+            background: var(--card-bg);
+            border-bottom: 1px solid #30363d;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+            z-index: 10;
+        }
+
+        .status-badge {
+            padding: 2px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+        .online { background: rgba(63, 185, 80, 0.15); color: var(--terminal-green); border: 1px solid var(--terminal-green); }
+        .offline { background: rgba(248, 81, 73, 0.15); color: var(--error-red); border: 1px solid var(--error-red); }
+
+        #console {
+            flex: 1;
+            overflow-y: auto;
+            padding: 15px 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 1px; /* 로그 간 간격 축소 */
+            scroll-behavior: auto;
+        }
+
+        .log-line {
+            display: flex;
+            gap: 15px;
+            padding: 1px 8px; /* 위아래 패딩 50% 이상 축소 */
+            border-radius: 4px;
+            transition: background 0.2s;
+            animation: fadeIn 0.2s ease-out;
+        }
+        .log-line:hover { background: rgba(255,255,255,0.03); }
+        .log-time { color: #8b949e; min-width: 80px; font-size: 12px; }
+        .log-text { word-break: break-all; white-space: pre-wrap; color: #d1d5da; }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateX(-5px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+
+        .controls { display: flex; gap: 10px; }
+        .btn {
+            background: #21262d;
+            border: 1px solid #30363d;
+            color: #c9d1d9;
+            padding: 6px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 13px;
+            transition: all 0.2s;
+        }
+        .btn:hover { background: #30363d; border-color: #8b949e; }
+        .btn-primary { background: var(--accent-color); color: white; border: none; }
+        .btn-primary:hover { opacity: 0.9; }
+    </style>
+</head>
+<body>
+    <div id="navbar">
+        <div style="display:flex; align-items:center; gap:15px;">
+            <h3 style="margin:0; color:var(--accent-color);">ESP32 CONSOLE</h3>
+            <div id="status-badge" class="status-badge offline">CONNECTING...</div>
+        </div>
+        <div class="controls">
+            <button class="btn" id="scroll-toggle" onclick="toggleAutoScroll()">AUTO-SCROLL: ON</button>
+            <button class="btn" onclick="clearConsole()">CLEAR</button>
+            <button class="btn btn-primary" onclick="rebootESP()">HARD RESET</button>
+        </div>
+    </div>
+    <div id="console"></div>
+
+    <script>
+        let lastId = 0;
+        let autoScroll = true;
+        const consoleEl = document.getElementById('console');
+
+        function toggleAutoScroll() {
+            autoScroll = !autoScroll;
+            document.getElementById('scroll-toggle').textContent = `AUTO-SCROLL: ${autoScroll ? 'ON' : 'OFF'}`;
+        }
+
+        function clearConsole() { consoleEl.innerHTML = ''; }
+
+        async function rebootESP() {
+            if(!confirm('ESP32를 강제 리셋하시겠습니까?')) return;
+            const res = await fetch('/reboot', { method: 'POST' });
+            if(res.ok) {
+                 const div = document.createElement('div');
+                 div.className = 'log-line';
+                 div.innerHTML = `<span class="log-time">SYSTEM</span><span class="log-text" style="color:orange;">>>> Reboot command sent</span>`;
+                 consoleEl.appendChild(div);
+            }
+        }
+
+        async function sync() {
+            try {
+                const res = await fetch(`/api/sync?last_id=${lastId}`);
+                const data = await res.json();
+                
+                // 상태 업데이트
+                const badge = document.getElementById('status-badge');
+                badge.textContent = data.connected ? 'ONLINE' : 'OFFLINE';
+                badge.className = `status-badge ${data.connected ? 'online' : 'offline'}`;
+
+                if (data.logs.length > 0) {
+                    const fragment = document.createDocumentFragment();
+                    data.logs.forEach(msg => {
+                        const div = document.createElement('div');
+                        div.className = 'log-line';
+                        div.innerHTML = `<span class="log-time">${msg.time}</span><span class="log-text">${escapeHtml(msg.text)}</span>`;
+                        fragment.appendChild(div);
+                    });
+                    consoleEl.appendChild(fragment);
+                    lastId = data.last_id;
+
+                    // 줄 수 관리 (메모리 최적화)
+                    while(consoleEl.children.length > 1000) consoleEl.removeChild(consoleEl.firstChild);
+                    
+                    if(autoScroll) consoleEl.scrollTop = consoleEl.scrollHeight;
+                }
+            } catch (e) {
+                console.error("Sync error", e);
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        setInterval(sync, 100);
+    </script>
+</body>
+</html>
+'''
+
 @app.route('/')
 def index():
-    return render_template_string('''
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>ESP-Web-Monitor</title>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Source+Code+Pro:wght@400;500;600&family=Roboto+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-        <style>
-            * {
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-            }
-            
-            body {
-                background-color: #0a0e14;
-                color: #00ff41;
-                font-family: 'Fira Code', 'Source Code Pro', 'Roboto Mono', 'Courier New', monospace;
-                margin: 0;
-                padding: 20px;
-                font-size: 15px;
-                line-height: 1.5;
-                font-variant-ligatures: none;
-                font-feature-settings: normal;
-                letter-spacing: 0;
-            }
-            
-            #log-container {
-                display: flex;
-                flex-direction: column;
-                background-color: #0d1117;
-                border: 2px solid #1f6feb;
-                border-radius: 8px;
-                padding: 15px;
-                box-shadow: 0 0 20px rgba(31, 111, 235, 0.3);
-            }
-            
-            .log-entry {
-                white-space: pre-wrap;
-                word-wrap: break-word;
-                overflow-wrap: break-word;
-                word-break: break-all;
-                padding: 3px 8px;
-                border-left: 3px solid transparent;
-                transition: all 0.2s ease;
-                font-weight: 400;
-                font-variant-ligatures: none;
-                font-feature-settings: normal;
-                letter-spacing: 0;
-                max-width: 100%;
-                overflow-x: auto;
-                animation: fadeIn 0.3s ease-in;
-            }
-            
-            @keyframes fadeIn {
-                from {
-                    opacity: 0;
-                    transform: translateY(-5px);
-                }
-                to {
-                    opacity: 1;
-                    transform: translateY(0);
-                }
-            }
-            
-            .log-entry:hover {
-                background-color: #161b22;
-                border-left-color: #00ff41;
-                box-shadow: 0 0 10px rgba(0, 255, 65, 0.2);
-            }
-            
-            .top-buttons {
-                position: fixed;
-                top: 20px;
-                right: 20px;
-                display: flex;
-                gap: 10px;
-                z-index: 1000;
-            }
+    return render_template_string(INDEX_HTML)
 
-            .retro-btn {
-                padding: 10px 20px;
-                background: transparent;
-                color: #00ff41;
-                border: 2px solid #00ff41;
-                border-radius: 2px;
-                cursor: pointer;
-                font-family: 'Fira Code', monospace;
-                font-size: 14px;
-                font-weight: bold;
-                text-transform: uppercase;
-                letter-spacing: 1px;
-                box-shadow: 0 0 10px rgba(0, 255, 65, 0.4);
-                transition: all 0.2s ease;
-            }
-            
-            .retro-btn:hover {
-                background: #00ff41;
-                color: #0a0e14;
-                box-shadow: 0 0 20px rgba(0, 255, 65, 0.8);
-            }
-            
-            .retro-btn:active {
-                transform: scale(0.98);
-            }
-            
-            .retro-btn:disabled {
-                border-color: #333;
-                color: #333;
-                box-shadow: none;
-                cursor: not-allowed;
-            }
-        </style>
-    </head>
-    <body>
-        <div class="top-buttons">
-            <button id="scroll-btn" class="retro-btn" onclick="toggleScroll()">PAUSE SCROLL</button>
-            <button id="reboot-btn" class="retro-btn" onclick="rebootESP32()">REBOOT ESP32</button>
-        </div>
-        <div id="log-container"></div>
-        <script>
-            let lastLogLength = 0;
-            let isAutoScrollEnabled = true;
-            const container = document.getElementById('log-container');
-            
-            function toggleScroll() {
-                isAutoScrollEnabled = !isAutoScrollEnabled;
-                const btn = document.getElementById('scroll-btn');
-                btn.textContent = isAutoScrollEnabled ? 'PAUSE SCROLL' : 'RESUME SCROLL';
-                if (isAutoScrollEnabled) {
-                    container.scrollIntoView({ behavior: 'smooth', block: 'end' });
-                }
-            }
-            
-            async function rebootESP32() {
-                const btn = document.getElementById('reboot-btn');
-                if (confirm('ESP32를 리부팅하시겠습니까?')) {
-                    btn.disabled = true;
-                    btn.textContent = 'REBOOTING...';
-                    
-                    try {
-                        const response = await fetch('/reboot', { method: 'POST' });
-                        const result = await response.json();
-                        
-                        if (result.success) {
-                            alert('ESP32가 리부팅되었습니다!');
-                            // 로그 초기화
-                            container.innerHTML = '';
-                            lastLogLength = 0;
-                        } else {
-                            alert('리부팅 실패: ' + result.error);
-                        }
-                    } catch (error) {
-                        alert('리부팅 요청 실패: ' + error);
-                    } finally {
-                        btn.disabled = false;
-                        btn.textContent = 'REBOOT ESP32';
-                    }
-                }
-            }
+@app.route('/api/sync')
+@app.route('/sync') # 하위 호환성 유지
+def api_sync():
+    try:
+        current_last_id = int(request.args.get('last_id', 0))
+        # 새 로그만 필터링
+        new_logs = [log for log in log_queue if log['id'] > current_last_id]
+        return jsonify({
+            "connected": is_connected,
+            "last_id": log_sequence,
+            "logs": new_logs,
+            "status": "Connected" if is_connected else "Disconnected",
+            "count": len(log_queue)
+        })
+    except Exception as e:
+        return jsonify({"connected": False, "last_id": 0, "logs": [], "error": str(e)})
 
-            function fetchLogs() {
-                fetch('/logs')
-                    .then(r => r.json())
-                    .then(logs => {
-                        if (logs.length === 0 && lastLogLength === 0) return; // 데이터 없음
-                        
-                        if (logs.length < lastLogLength) {
-                             container.innerHTML = ''; 
-                             lastLogLength = 0;
-                        }
-
-                        if (logs.length > lastLogLength) {
-                            const newLogs = logs.slice(lastLogLength);
-                            lastLogLength = logs.length;
-
-                            const fragment = document.createDocumentFragment();
-                            newLogs.forEach(text => {
-                                const div = document.createElement('div');
-                                div.className = 'log-entry';
-                                div.textContent = text;
-                                fragment.appendChild(div);
-                            });
-                             container.appendChild(fragment);
-                             
-                             // 부드러운 스크롤 (활성화된 경우에만)
-                             if (isAutoScrollEnabled) {
-                                 container.scrollIntoView({ behavior: 'smooth', block: 'end' });
-                             }
-                         }
-                     })
-                     .catch(e => console.error("Fetch error:", e));
-             }
-            setInterval(fetchLogs, 50);  // 50ms마다 업데이트 (더 부드러운 스트리밍) 
-        </script>
-    </body>
-    </html>
-    ''')
-
-@app.route('/logs')
-def get_logs():
-    return jsonify(list(log_buffer))
+@app.route('/status') # 하위 호환성 유지
+def api_status():
+    return jsonify({
+        "status": "Connected" if is_connected else "Disconnected",
+        "count": len(log_queue),
+        "last_id": log_sequence,
+        "connected": is_connected
+    })
 
 @app.route('/reboot', methods=['POST'])
-def reboot_esp32():
-    try:
-        # esptool을 사용하여 ESP32 리셋
-        result = subprocess.run(
-            ['python', '-m', 'esptool', '--port', SERIAL_PORT, 'run'],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        
-        if result.returncode == 0:
-            # 로그 버퍼 초기화
-            log_buffer.clear()
-            return jsonify({'success': True, 'message': 'ESP32 rebooted successfully'})
-        else:
-            return jsonify({'success': False, 'error': result.stderr})
-    except subprocess.TimeoutExpired:
-        return jsonify({'success': False, 'error': 'Reboot timeout'})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+def reboot():
+    global serial_inst
+    with serial_lock:
+        if serial_inst:
+            serial_inst.dtr = False
+            serial_inst.rts = True
+            time.sleep(0.1)
+            serial_inst.rts = False
+            time.sleep(0.1)
+            log_queue.clear() # 리부팅 시 버퍼 초기화
+            return jsonify({"success": True})
+    return jsonify({"success": False}), 400
 
 if __name__ == '__main__':
-    t = threading.Thread(target=read_serial)
-    t.daemon = True
-    t.start()
+    threading.Thread(target=serial_listener, daemon=True).start()
     app.run(host='0.0.0.0', port=8080, debug=False)

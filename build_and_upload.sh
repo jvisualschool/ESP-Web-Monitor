@@ -15,7 +15,7 @@ NC='\033[0m' # No Color
 # 현재 스크립트 위치 기준 설정
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_DIR="$SCRIPT_DIR/hello_world"
-SERIAL_PORT="/dev/cu.usbmodem1101"
+SERIAL_PORT="/dev/cu.usbmodem2101"
 FLASK_SERVER_SCRIPT="$SCRIPT_DIR/serial_web_server.py"
 VENV_PATH="$SCRIPT_DIR/.venv"
 
